@@ -20,6 +20,86 @@ This rewrite was created  because the original version stopped working due to up
 
 ---
 
+## Notes for Raspberry Pi 3A+ and HyperPixel Setup
+
+I had loads of trouble getting the screen to work with my older Raspberry, so I'm including some notes about that. You can probably ignore this section if you have a newer Pi. For best results on a Raspberry Pi 3A+ with a HyperPixel Square display, I recommend:
+
+### 1. Use Raspberry Pi OS Bookworm Lite
+
+* Download the **Lite** version (headless) from the [official Raspberry Pi downloads page](https://www.raspberrypi.com/software/operating-systems/).
+* Avoid using the desktop version — the framebuffer-based display works more reliably without a GUI.
+
+### 2. Enable SPI and I2C
+
+```bash
+sudo raspi-config
+```
+
+* Navigate to `Interface Options`
+* Enable both **SPI** and **I2C**
+
+### 3. Install Legacy HyperPixel Drivers
+
+The modern Pimoroni HyperPixel installer doesn't support Bookworm correctly. Instead, use the legacy version:
+
+```bash
+git clone https://github.com/pimoroni/hyperpixel4
+cd hyperpixel4
+sudo ./install.sh
+```
+
+* 📎 Source: [https://github.com/pimoroni/hyperpixel4](https://github.com/pimoroni/hyperpixel4)
+
+If you're using a square display, select the square variant when prompted.
+
+### 4. Target the Correct Framebuffer
+
+HyperPixel usually renders to `/dev/fb1`, not the default `/dev/fb0`. You may need to change the `fbi` command in the script to:
+
+```bash
+sudo fbi -T 1 -d /dev/fb1 -noverbose -a /tmp/current_album.jpg
+```
+
+If you’re testing manually, try:
+
+```bash
+sudo fbi -T 1 -d /dev/fb1 -noverbose -a path/to/your/image.jpg
+```
+
+These steps help avoid blank screens, unresponsive touch, or incorrect display mapping.
+
+For best results on a Raspberry Pi 3A+ with a HyperPixel Square display, we recommend:
+
+* Using **Raspberry Pi OS Bookworm Lite** (headless, no desktop environment)
+
+* Enabling **SPI and I2C** via `raspi-config`:
+
+  ```bash
+  sudo raspi-config
+  ```
+
+  Navigate to `Interface Options`, then enable both SPI and I2C.
+
+* Installing **legacy HyperPixel drivers**:
+  Pimoroni’s newer installer may not work on Bookworm. Instead, clone the legacy HyperPixel 4 repo and follow instructions:
+
+  ```bash
+  git clone https://github.com/pimoroni/hyperpixel4
+  cd hyperpixel4
+  sudo ./install.sh
+  ```
+
+* Ensuring the **correct framebuffer device** is targeted.
+  HyperPixel typically maps to `/dev/fb1`, so you may need to edit the script’s `fbi` command to:
+
+  ```bash
+  sudo fbi -T 1 -d /dev/fb1 -noverbose ...
+  ```
+
+These steps help avoid blank screens or device mismatch errors with `fbi`.
+
+---
+
 ## Hardware Requirements
 
 * Raspberry Pi (tested on **3A+**)

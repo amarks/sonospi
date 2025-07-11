@@ -1,5 +1,7 @@
 # SonosPi
 
+![SonosPi display running](img/demo.jpg)
+
 SonosPi is a minimalist Raspberry Pi–powered display that shows the currently playing album art from your Sonos system. Designed to be simple, unobtrusive, and always-on, it turns off the screen when playback is paused and wakes it when music resumes.
 
 Credit for the concept and original version goes to **Mark Hank**, who wrote a fantastic how to guide that you'll find here: [https://www.hackster.io/mark-hank/sonos-album-art-on-raspberry-pi-screen-5b0012. ](https://www.hackster.io/mark-hank/sonos-album-art-on-raspberry-pi-screen-5b0012. )

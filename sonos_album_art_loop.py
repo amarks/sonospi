@@ -122,6 +122,7 @@ try:
                             img.save("/tmp/album_art.jpg")
                             response.close()
 
+                            # Compare with current image before displaying
                             with open("/tmp/album_art.jpg", "rb") as new_img, open(current_image_path, "rb") as current_img:
                                 if new_img.read() != current_img.read():
                                     shutil.copyfile("/tmp/album_art.jpg", current_image_path)
@@ -141,6 +142,7 @@ try:
                 else:
                     log("No album art URL available.")
 
+                # Turn screen on
                 try:
                     with open("/sys/class/backlight/rpi_backlight/bl_power", "w") as f:
                         f.write("0")

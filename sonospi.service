@@ -1,0 +1,14 @@
+[Unit]
+Description=SonosPi Album Art Display
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/sonospi/sonos_album_art_loop.py
+WorkingDirectory=/home/pi/sonospi
+StandardOutput=append:/home/pi/sonospi.log
+StandardError=append:/home/pi/sonospi.log
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target

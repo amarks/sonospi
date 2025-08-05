@@ -1,2 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Logs
 *.log
 *.log.*
+
+# System files
+.DS_Store
+
+# OS/Raspberry Pi (ignore sensitive or system-wide paths)
+/boot/
+/var/
+/etc/
+
+# Env
+.env
+

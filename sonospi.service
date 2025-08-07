@@ -1,14 +1,32 @@
+sudo tee /etc/systemd/system/sonospi.service >/dev/null <<'EOF'
 [Unit]
-Description=SonosPi Album Art Display
-After=network.target
+Description=Sonos Album Art Display Service
+After=multi-user.target network-online.target
+Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/pi/sonospi/sonos_album_art_loop.py
-WorkingDirectory=/home/pi/sonospi
-StandardOutput=append:/home/pi/sonospi.log
-StandardError=append:/home/pi/sonospi.log
+Type=simple
+User=alan
+WorkingDirectory=/home/alan/sonospi
+ExecStart=/usr/bin/python3 /home/alan/sonospi/sonos_album_art_loop.py
 Restart=always
-User=pi
+RestartSec=3
+# Give the process direct console access if needed (kept permissive)
+TTYPath=/dev/tty1
+# Environment can be extended later if needed
+Environment=PYTHONUNBUFFERED=1
+
+# Optional: basic memory/CPU limits (tweak if you like)
+#MemoryMax=150M
+#CPUQuota=50%
+
+# Optional: watchdog heartbeat (enable if we add a watchdog)
+#WatchdogSec=30s
+#NotifyAccess=all
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now sonospi.service

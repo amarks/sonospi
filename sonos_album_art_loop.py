@@ -3,12 +3,11 @@ import requests
 from PIL import Image
 from io import BytesIO
 import time
-import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import os
-import shutil
 import signal
+import sys
 from logging.handlers import RotatingFileHandler
 
 # Setup logging with rotation
@@ -17,159 +16,150 @@ handler = RotatingFileHandler(log_path, maxBytes=1024*1024, backupCount=3)
 logging.basicConfig(
     handlers=[handler],
     level=logging.INFO,
-    format="%(asctime)s - %(message)s",
+    format='%(asctime)s %(levelname)s: %(message)s',
 )
-log = logging.info
+logger = logging.getLogger(__name__)
 
-def find_active_playing_speaker():
-    speakers = list(soco.discover())
-    if not speakers:
-        log("No Sonos speakers found on network.")
-        return None
+# --- Framebuffer verification ---
+FB_DEV = "/dev/fb0"
+FB_SYSFS = "/sys/class/graphics/fb0"
 
-    for spk in speakers:
-        try:
-            state = spk.get_current_transport_info().get("current_transport_state", "UNKNOWN")
-            track = spk.get_current_track_info()
-            uri = track.get("uri", "")
-            album_art = track.get("album_art", "")
-            if state == "PLAYING" and album_art and not uri.startswith("x-rincon:"):
-                log(f"Selected active speaker: {spk.player_name}")
-                return spk
-        except Exception as e:
-            log(f"Error checking speaker {spk}: {e}")
-
-    log("No active playing speaker with valid album art found.")
-    return None
-
-# Ensure black.png exists
-black_image_path = "/home/alan/sonospi/black.png"
-if not os.path.exists(black_image_path):
+def _read(path, default=None):
     try:
-        img = Image.new("RGB", (720, 720), color="black")
-        img.save(black_image_path)
-        log("Created black screen image.")
-    except Exception as e:
-        log(f"Error creating black screen image: {e}")
+        with open(path, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return default
 
-# Create static display image file
-current_image_path = "/tmp/current_art.jpg"
+# Probe framebuffer size & bpp from sysfs (fallback to 720x720x32)
+virtual_size = _read(os.path.join(FB_SYSFS, "virtual_size"), "720,720")
 try:
-    shutil.copyfile(black_image_path, current_image_path)
-    log("Initialized current_art.jpg with black image.")
+    WIDTH, HEIGHT = [int(x) for x in virtual_size.split(",")[:2]]
+except Exception:
+    WIDTH, HEIGHT = 720, 720
+
+try:
+    BPP = int(_read(os.path.join(FB_SYSFS, "bits_per_pixel"), "32"))
+except Exception:
+    BPP = 32
+
+PIXEL_FORMAT = "BGRA"  # empirically correct for this setup (rgba 8/16,8/8,8/0,8/24)
+BYTES_PER_PIXEL = BPP // 8
+FRAMEBUFFER_BYTES = WIDTH * HEIGHT * BYTES_PER_PIXEL
+
+logger.info(f"Framebuffer sysinfo: {WIDTH}x{HEIGHT} @ {BPP}bpp, writing format={PIXEL_FORMAT}")
+
+# Set up directories
+blank_path = "/home/alan/sonospi/black.png"
+
+# Ensure blank image exists
+if not os.path.exists(blank_path):
+    logger.warning(f"Blank image not found at {blank_path}, creating fallback black image.")
+    from PIL import Image as _PILImage
+    _PILImage.new('RGB', (WIDTH, HEIGHT), 'black').save(blank_path)
+
+# Clear framebuffer on start
+try:
+    with open(FB_DEV, 'wb') as fb:
+        fb.write(b'\x00' * FRAMEBUFFER_BYTES)
+    logger.info("Framebuffer cleared.")
 except Exception as e:
-    log(f"Error initializing current image: {e}")
+    logger.warning(f"Could not clear framebuffer: {e}")
 
-# Function to kill any running fbi process
-def kill_fbi():
+# Handle graceful shutdown
+running = True
+
+def handle_sigterm(signum, frame):
+    global running
+    running = False
+signal.signal(signal.SIGTERM, handle_sigterm)
+
+# Blank the screen
+blank_displayed = False
+
+def display_image(image):
     try:
-        subprocess.run(["sudo", "pkill", "-f", "fbi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Resize and convert to expected pixel order
+        img = image.resize((WIDTH, HEIGHT)).convert('RGBA')
+        raw = img.tobytes('raw', PIXEL_FORMAT)  # BGRA bytes
+        with open(FB_DEV, 'wb') as fb:
+            fb.write(raw)
+        logger.debug(f"Wrote {len(raw)} bytes to framebuffer ({WIDTH}x{HEIGHT}x{BPP}).")
     except Exception as e:
-        log(f"Error killing fbi: {e}")
+        logger.error(f"Failed to write image to framebuffer: {e}")
 
-# Function to display an image using fbi
-def show_image(path):
-    kill_fbi()
-    time.sleep(0.2)
-    subprocess.Popen(
-        ["sudo", "fbi", "-T", "1", "-d", "/dev/fb0", "--noverbose", "-a", path],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
 
-# Show initial black screen
-show_image(current_image_path)
-log("Started with black screen.")
-
-last_url = ""
-last_state = ""
-coordinator = None
-
-try:
-    while True:
+def blank_screen():
+    global blank_displayed
+    if not blank_displayed:
         try:
-            # Re-evaluate active speaker periodically
-            new_coordinator = find_active_playing_speaker()
-            if new_coordinator:
-                if coordinator != new_coordinator:
-                    log(f"Switching coordinator to: {new_coordinator.player_name}")
-                coordinator = new_coordinator
-            else:
-                log("Falling back to manual IP: 192.168.4.36")
-                coordinator = soco.SoCo("192.168.4.36")
+            from PIL import Image as _PILImage
+            image = _PILImage.open(blank_path)
+            display_image(image)
+            blank_displayed = True
+            logger.info("No album art found. Screen blanked.")
+        except Exception as e:
+            logger.error(f"Failed to blank screen: {e}")
 
-            transport_info = coordinator.get_current_transport_info()
-            state = transport_info.get("current_transport_state", "UNKNOWN")
-            log(f"Playback State: {state}")
+# Display the image
+last_image_url = None
 
-            if state == "PLAYING":
-                if last_state != "PLAYING":
-                    log("Playback state changed to PLAYING.")
+def display_album_art(url, speaker_name):
+    global last_image_url, blank_displayed
+    if url == last_image_url:
+        return
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        from PIL import Image as _PILImage
+        image = _PILImage.open(BytesIO(response.content))
+        display_image(image)
+        last_image_url = url
+        blank_displayed = False
+        logger.info(f"Displaying album art from {speaker_name}: {url}")
+    except Exception as e:
+        logger.error(f"Failed to fetch or display image: {e}")
+        blank_screen()
 
-                track_info = coordinator.get_current_track_info()
-                log(f"Track Info: {track_info}")
-                album_art_url = track_info.get("album_art")
+# Main loop
+import soco
+speakers = list(soco.discover()) or []
+logger.info(f"Discovered {len(speakers)} speakers.")
+last_discovery = datetime.now()
 
-                if album_art_url:
-                    log(f"Album art URL: {album_art_url}")
+while running:
+    try:
+        # Rediscover speakers every 5 minutes
+        if datetime.now() - last_discovery > timedelta(minutes=5):
+            speakers = list(soco.discover()) or []
+            logger.info(f"Rediscovered {len(speakers)} speakers.")
+            last_discovery = datetime.now()
 
-                    if album_art_url != last_url:
-                        log("Fetching new album art...")
-                        try:
-                            response = requests.get(album_art_url, timeout=10)
-                            img = Image.open(BytesIO(response.content))
-                            img = img.resize((720, 720))
-                            img.save("/tmp/album_art.jpg")
-                            response.close()
-
-                            # Compare with current image before displaying
-                            with open("/tmp/album_art.jpg", "rb") as new_img, open(current_image_path, "rb") as current_img:
-                                if new_img.read() != current_img.read():
-                                    shutil.copyfile("/tmp/album_art.jpg", current_image_path)
-                                    log("Downloaded and updated album art.")
-                                    show_image(current_image_path)
-                                    log("Displayed new album art.")
-                                else:
-                                    log("Image is identical to current. Skipping display update.")
-
-                            last_url = album_art_url
-                        except Exception as e:
-                            log(f"Error fetching album art: {e}")
-                            time.sleep(10)
-                            continue
+        found_art = False
+        for speaker in speakers:
+            try:
+                track_info = speaker.get_current_track_info()
+                art_url = track_info.get('album_art')
+                if art_url:
+                    if art_url.startswith("http"):
+                        full_url = art_url
                     else:
-                        log("No change in album art.")
-                else:
-                    log("No album art URL available.")
+                        full_url = f"http://{speaker.ip_address}:1400{art_url}"
+                    display_album_art(full_url, speaker.player_name)
+                    found_art = True
+                    break
+            except Exception as e:
+                logger.warning(f"Error checking speaker {getattr(speaker, 'player_name', 'unknown')}: {e}")
 
-                # Turn screen on
-                try:
-                    with open("/sys/class/backlight/rpi_backlight/bl_power", "w") as f:
-                        f.write("0")
-                except Exception as e:
-                    log(f"Error turning on screen: {e}")
+        if not found_art:
+            blank_screen()
 
-                last_state = "PLAYING"
+    except Exception as e:
+        logger.error(f"Unexpected error in loop: {e}")
+        blank_screen()
 
-            else:
-                if last_state != "NOT_PLAYING":
-                    log("Speaker is not playing. Turning screen OFF.")
-                    try:
-                        with open("/sys/class/backlight/rpi_backlight/bl_power", "w") as f:
-                            f.write("1")
-                    except Exception as e:
-                        log(f"Error turning off screen: {e}")
-                    last_url = ""
-                else:
-                    log("No change in playback state, skipping screen update.")
+    time.sleep(5)
 
-                last_state = "NOT_PLAYING"
-
-        except Exception as loop_error:
-            log(f"Unexpected error in main loop: {loop_error}")
-            time.sleep(10)
-
-        time.sleep(5)
-
-except KeyboardInterrupt:
-    log("Script stopped by user.")
+# Cleanup on exit
+blank_screen()
+logger.info("Shutting down.")

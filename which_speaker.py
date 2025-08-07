@@ -1,6 +1,6 @@
 import soco
 
-# Utility to discover all Sonos devices on the network. Just used for diagnostics and troubleshooting.
+# Utility to discover all Sonos devices on the network. Just used for diagnostics and troubleshooting.  
 devices = soco.discover()
 
 if not devices:

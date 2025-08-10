@@ -74,8 +74,24 @@ def handle_sigterm(signum, frame):
     running = False
 signal.signal(signal.SIGTERM, handle_sigterm)
 
+# --- Helpers ---
+
+def _hhmmss_to_seconds(s: str) -> int:
+    try:
+        parts = [int(p) for p in s.split(":")]
+        if len(parts) == 3:
+            h, m, sec = parts
+        elif len(parts) == 2:
+            h, m, sec = 0, parts[0], parts[1]
+        else:
+            return 0
+        return h*3600 + m*60 + sec
+    except Exception:
+        return 0
+
 # Blank the screen
 blank_displayed = False
+
 
 def display_image(image):
     try:
@@ -90,19 +106,24 @@ def display_image(image):
 
 
 def blank_screen():
-    global blank_displayed
-    if not blank_displayed:
-        try:
-            from PIL import Image as _PILImage
-            image = _PILImage.open(blank_path)
-            display_image(image)
-            blank_displayed = True
-            logger.info("No album art found. Screen blanked.")
-        except Exception as e:
-            logger.error(f"Failed to blank screen: {e}")
+    global blank_displayed, last_image_url
+    try:
+        from PIL import Image as _PILImage
+        image = _PILImage.open(blank_path)
+        display_image(image)
+        blank_displayed = True
+        last_image_url = None  # force refresh on next valid art
+        logger.info("No album art found. Screen blanked.")
+    except Exception as e:
+        logger.error(f"Failed to blank screen: {e}")
 
 # Display the image
 last_image_url = None
+
+# Track last known positions to detect stale/stuck PLAYING states
+# key: speaker.uid -> { 'pos': seconds, 't': datetime }
+last_pos = {}
+
 
 def display_album_art(url, speaker_name):
     global last_image_url, blank_displayed
@@ -122,10 +143,12 @@ def display_album_art(url, speaker_name):
         blank_screen()
 
 # Main loop
-import soco
 speakers = list(soco.discover()) or []
 logger.info(f"Discovered {len(speakers)} speakers.")
 last_discovery = datetime.now()
+
+# How long we tolerate a non-advancing position while state==PLAYING before treating as stopped
+STALE_WINDOW_SEC = 12
 
 while running:
     try:
@@ -136,18 +159,36 @@ while running:
             last_discovery = datetime.now()
 
         found_art = False
+        now = datetime.now()
+
         for speaker in speakers:
             try:
-                track_info = speaker.get_current_track_info()
+                tinfo = speaker.get_current_transport_info()
+                state = (tinfo or {}).get('current_transport_state', '')
+                if state != 'PLAYING':
+                    continue  # only consider actively playing speakers
+
+                track_info = speaker.get_current_track_info() or {}
                 art_url = track_info.get('album_art')
-                if art_url:
-                    if art_url.startswith("http"):
-                        full_url = art_url
-                    else:
-                        full_url = f"http://{speaker.ip_address}:1400{art_url}"
-                    display_album_art(full_url, speaker.player_name)
-                    found_art = True
-                    break
+                pos_s = _hhmmss_to_seconds(track_info.get('position', '0:00:00'))
+
+                # Detect stale PLAYING states (position not advancing)
+                lp = last_pos.get(speaker.uid)
+                if lp is not None:
+                    prev_pos, prev_t = lp['pos'], lp['t']
+                    if pos_s <= prev_pos and (now - prev_t).total_seconds() >= STALE_WINDOW_SEC:
+                        logger.info(f"Ignoring stale PLAYING on {speaker.player_name} (position not advancing).")
+                        continue
+                # update last pos snapshot
+                last_pos[speaker.uid] = {'pos': pos_s, 't': now}
+
+                if not art_url:
+                    continue
+                full_url = art_url if art_url.startswith('http') else f"http://{speaker.ip_address}:1400{art_url}"
+                display_album_art(full_url, speaker.player_name)
+                found_art = True
+                break
+
             except Exception as e:
                 logger.warning(f"Error checking speaker {getattr(speaker, 'player_name', 'unknown')}: {e}")
 

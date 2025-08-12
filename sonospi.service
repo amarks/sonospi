@@ -3,7 +3,7 @@ sudo tee /etc/systemd/system/sonospi.service >/dev/null <<'EOF'
 Description=Sonos Album Art Display Service
 After=multi-user.target network-online.target
 Wants=network-online.target
-
+ 
 [Service]
 Type=simple
 User=alan

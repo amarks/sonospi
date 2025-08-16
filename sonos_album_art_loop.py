@@ -32,6 +32,7 @@ FB_SYSFS = "/sys/class/graphics/fb0"
 _BACKLIGHT_NODE = "/sys/class/backlight/rpi_backlight"  # your device
 _BACKLIGHT_LAST_BRIGHTNESS = None
 
+# --- Helpers to read/write sysfs ---
 def _read(path, default=None):
     try:
         with open(path, "r") as f:
@@ -145,12 +146,13 @@ def display_power_on():
 
 # ---------- Shutdown handling ----------
 running = True
+
 def _handle_sigterm(signum, frame):
     global running
     running = False
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
-# ---------- Helpers ----------
+# ---------- Utility helpers ----------
 def _hhmmss_to_seconds(s: str) -> int:
     try:
         parts = [int(p) for p in s.split(":")]
@@ -176,6 +178,35 @@ def _display_image(image: Image.Image):
 last_image_url = None
 blank_displayed = False
 
+# Cache of bad/forbidden art URLs we should avoid spamming (URL -> expiry_ts)
+BAD_ART_CACHE = {}
+BAD_ART_TTL_SEC = int(os.environ.get("BAD_ART_TTL_SEC", "180"))  # 3 minutes default
+
+
+def _is_definitely_bad_art_url(url: str) -> bool:
+    if not url:
+        return True
+    u = url.lower()
+    # Common bad patterns observed: p-cdn returning "undefined_500W_500H.jpg"
+    if "undefined_" in u or u.endswith("/undefined"):
+        return True
+    return False
+
+
+def _in_bad_cache(url: str) -> bool:
+    exp = BAD_ART_CACHE.get(url)
+    if exp is None:
+        return False
+    if exp < time.time():
+        BAD_ART_CACHE.pop(url, None)
+        return False
+    return True
+
+
+def _mark_bad(url: str):
+    BAD_ART_CACHE[url] = time.time() + BAD_ART_TTL_SEC
+
+
 def blank_screen():
     """Prefer true panel off; fallback to drawing black."""
     global blank_displayed, last_image_url
@@ -194,27 +225,42 @@ def blank_screen():
     except Exception as e:
         logger.error(f"Blanking failed: {e}")
 
-def display_album_art(url, speaker_name):
-    """Ensure panel is on; redraw if screen was previously off even for same URL."""
-    global last_image_url, blank_displayed
-    # If the screen was previously off, force a redraw even if URL unchanged
-    if url == last_image_url and not blank_displayed:
-        return
-    if url == last_image_url and blank_displayed:
-        logger.info("Art: forcing redraw of existing URL because screen was off/blanked")
 
-    display_power_on()
+def display_album_art(url, speaker_name):
+    """Fetch first; only power on and draw if fetch succeeds.
+    On failure, keep whatever is currently on screen to avoid flicker.
+    """
+    global last_image_url, blank_displayed
+
+    # Skip obviously bad URLs or those recently failing
+    if _is_definitely_bad_art_url(url) or _in_bad_cache(url):
+        logger.warning(f"Art: skipping bad URL: {url}")
+        return False
+
     try:
+        # Fetch BEFORE turning the screen on, to avoid flashes
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         image = Image.open(BytesIO(r.content))
+        try:
+            w, h = image.size
+            if w < 64 or h < 64:
+                raise ValueError(f"art too small {w}x{h}")
+        except Exception:
+            pass
+
+        # Success → ensure display on, then draw
+        display_power_on()
         _display_image(image)
         last_image_url = url
         blank_displayed = False
         logger.info(f"Art: {speaker_name} -> {url}")
+        return True
     except Exception as e:
         logger.error(f"Art fetch/display failed: {e}")
-        blank_screen()
+        _mark_bad(url)
+        # Do NOT blank here. Keep last good frame to avoid flicker.
+        return False
 
 # ---------- Touch controls ----------
 # Single tap = play/pause; Double tap = next track (register on RELEASE).
@@ -437,13 +483,16 @@ speakers = list(soco.discover()) or []
 logger.info(f"Discovered {len(speakers)} speakers.")
 last_discovery = datetime.now()
 
+
 def _get_speakers_snapshot():
     return speakers
+
 
 def _force_refresh_after_action():
     global last_image_url, blank_displayed
     blank_displayed = True    # so next draw forces redraw even if same URL
     last_image_url = last_image_url  # unchanged
+
 
 _start_touch_listener(_get_speakers_snapshot, _force_refresh_after_action)
 
@@ -452,6 +501,7 @@ last_pos = {}
 
 while running:
     try:
+        # periodic rediscovery
         if datetime.now() - last_discovery > timedelta(minutes=5):
             speakers = list(soco.discover()) or []
             logger.info(f"Rediscovered {len(speakers)} speakers.")
@@ -470,6 +520,7 @@ while running:
                 track_info = speaker.get_current_track_info() or {}
                 art_url = track_info.get("album_art")
                 if not art_url:
+                    # no art, keep searching other speakers
                     continue
 
                 # staleness: position must advance unless source doesn't provide position
@@ -483,14 +534,21 @@ while running:
                 last_pos[speaker.uid] = {"pos": pos_s, "t": now}
 
                 full_url = art_url if art_url.startswith("http") else f"http://{speaker.ip_address}:1400{art_url}"
-                display_album_art(full_url, speaker.player_name)
-                set_last_active_speaker_uid(getattr(speaker, "uid", None))
-                found_art = True
-                break
+
+                # Try to display. If it fails, don't blank; just keep prior frame.
+                success = display_album_art(full_url, speaker.player_name)
+                if success:
+                    set_last_active_speaker_uid(getattr(speaker, "uid", None))
+                    found_art = True
+                    break
+                else:
+                    # URL bad for this speaker; try next speaker (if any)
+                    continue
             except Exception as e:
                 logger.warning(f"Speaker check error ({getattr(speaker, 'player_name', 'unknown')}): {e}")
 
         if not found_art:
+            logger.info("No valid art this cycle → blanking screen.")
             blank_screen()
     except Exception as e:
         logger.error(f"Main loop error: {e}")

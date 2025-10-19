@@ -7,10 +7,11 @@ import subprocess
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from io import BytesIO
+import threading
 
 import soco
 import requests
-from PIL import Image
+from PIL import Image, ImageDraw
 
 # -------- Optional touchscreen (evdev) ----------
 try:
@@ -29,8 +30,17 @@ logger = logging.getLogger(__name__)
 # ---------- Framebuffer ----------
 FB_DEV = "/dev/fb0"
 FB_SYSFS = "/sys/class/graphics/fb0"
-_BACKLIGHT_NODE = "/sys/class/backlight/rpi_backlight"  # your device
+_BACKLIGHT_NODE = "/sys/class/backlight/rpi_backlight"  # adjust if needed
 _BACKLIGHT_LAST_BRIGHTNESS = None
+
+# --- UI config (minimal) ---
+FEEDBACK_ENABLE = os.environ.get("FEEDBACK_ENABLE", "1") != "0"
+FEEDBACK_ICON_FRACTION = float(os.environ.get("FEEDBACK_ICON_FRACTION", "0.35"))
+FEEDBACK_FG_ALPHA = int(os.environ.get("FEEDBACK_FG_ALPHA", "230"))
+FEEDBACK_COLOR = os.environ.get("FEEDBACK_COLOR", "#FFFFFF")
+FEEDBACK_PAUSE_BLANK_MS = int(os.environ.get("FEEDBACK_PAUSE_BLANK_MS", "1000"))
+FEEDBACK_AA_SCALE = int(os.environ.get("FEEDBACK_AA_SCALE", "4"))
+FEEDBACK_RADIUS_FRAC = float(os.environ.get("FEEDBACK_RADIUS_FRAC", "0.22"))
 
 # --- Helpers to read/write sysfs ---
 def _read(path, default=None):
@@ -87,17 +97,14 @@ try:
 except Exception as e:
     logger.warning(f"Could not clear framebuffer: {e}")
 
-# ---------- Display power control (true off/on) ----------
+# ---------- Display power control ----------
 def display_power_off():
     ok = False
-    # 1) Stop scanout
     if _set_file(f"{FB_SYSFS}/blank", "1"):
         ok = True
         logger.info("Display: fb0 blank=1")
-    # 2) Backlight OFF (preferred via bl_power)
     node = _BACKLIGHT_NODE
     if node and os.path.isdir(node):
-        # remember brightness (best effort)
         global _BACKLIGHT_LAST_BRIGHTNESS
         cur = _read_int(f"{node}/brightness")
         if cur is not None:
@@ -106,11 +113,9 @@ def display_power_off():
             ok = True
             logger.info("Backlight: off (bl_power=1)")
         else:
-            # fallback to brightness=0
             if _set_file(f"{node}/brightness", "0"):
                 ok = True
                 logger.info("Backlight: off (brightness=0)")
-    # 3) HDMI path (harmless if not present)
     try:
         subprocess.run(
             ["/usr/bin/vcgencmd", "display_power", "0"],
@@ -121,21 +126,17 @@ def display_power_off():
     return ok
 
 def display_power_on():
-    # 1) Unblank scanout
     if _set_file(f"{FB_SYSFS}/blank", "0"):
         logger.info("Display: fb0 blank=0")
-    # 2) Backlight ON (+ restore brightness if we have it)
     node = _BACKLIGHT_NODE
     if node and os.path.isdir(node):
         _set_file(f"{node}/bl_power", "0")
         global _BACKLIGHT_LAST_BRIGHTNESS
         if _BACKLIGHT_LAST_BRIGHTNESS is None:
-            # default to current or mid-brightness
             cur = _read_int(f"{node}/brightness", 128)
             _BACKLIGHT_LAST_BRIGHTNESS = cur
         _set_file(f"{node}/brightness", str(_BACKLIGHT_LAST_BRIGHTNESS))
         logger.info("Backlight: on (bl_power=0)")
-    # 3) HDMI path
     try:
         subprocess.run(
             ["/usr/bin/vcgencmd", "display_power", "1"],
@@ -146,7 +147,6 @@ def display_power_on():
 
 # ---------- Shutdown handling ----------
 running = True
-
 def _handle_sigterm(signum, frame):
     global running
     running = False
@@ -166,6 +166,12 @@ def _hhmmss_to_seconds(s: str) -> int:
     except Exception:
         return 0
 
+def _seconds_to_hhmmss(total: int) -> str:
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    return f"{h}:{m:02}:{s:02}"
+
 def _display_image(image: Image.Image):
     try:
         img = image.resize((WIDTH, HEIGHT)).convert("RGBA")
@@ -176,22 +182,18 @@ def _display_image(image: Image.Image):
         logger.error(f"Framebuffer write failed: {e}")
 
 last_image_url = None
+last_image_frame = None   # cached, screen-sized RGBA frame for instant resume
 blank_displayed = False
 
-# Cache of bad/forbidden art URLs we should avoid spamming (URL -> expiry_ts)
+# Cache of bad/forbidden art URLs (URL -> expiry_ts)
 BAD_ART_CACHE = {}
-BAD_ART_TTL_SEC = int(os.environ.get("BAD_ART_TTL_SEC", "180"))  # 3 minutes default
-
+BAD_ART_TTL_SEC = int(os.environ.get("BAD_ART_TTL_SEC", "180"))
 
 def _is_definitely_bad_art_url(url: str) -> bool:
     if not url:
         return True
     u = url.lower()
-    # Common bad patterns observed: p-cdn returning "undefined_500W_500H.jpg"
-    if "undefined_" in u or u.endswith("/undefined"):
-        return True
-    return False
-
+    return ("undefined_" in u) or u.endswith("/undefined")
 
 def _in_bad_cache(url: str) -> bool:
     exp = BAD_ART_CACHE.get(url)
@@ -202,71 +204,173 @@ def _in_bad_cache(url: str) -> bool:
         return False
     return True
 
-
 def _mark_bad(url: str):
     BAD_ART_CACHE[url] = time.time() + BAD_ART_TTL_SEC
 
-
 def blank_screen():
-    """Prefer true panel off; fallback to drawing black."""
+    """Paint black into the buffer, then power off. Prevents stale-frame flashes on next unblank."""
     global blank_displayed, last_image_url
-    if display_power_off():
-        blank_displayed = True
-        last_image_url = None
-        logger.info("Screen off.")
-        return
-    # Fallback: draw black if power-off not possible
     try:
         image = Image.open(blank_path)
-        _display_image(image)
-        blank_displayed = True
-        last_image_url = None
-        logger.info("Screen blanked (framebuffer black).")
+        _display_image(image)  # black buffer first
     except Exception as e:
-        logger.error(f"Blanking failed: {e}")
+        logger.debug(f"Blanking: framebuffer black draw failed (non-fatal): {e}")
 
+    if display_power_off():
+        logger.info("Screen off.")
+    else:
+        logger.info("Screen blanked (framebuffer black).")
+
+    blank_displayed = True
+    last_image_url = None
 
 def display_album_art(url, speaker_name):
-    """Fetch first; only power on and draw if fetch succeeds.
-    On failure, keep whatever is currently on screen to avoid flicker.
-    """
-    global last_image_url, blank_displayed
-
-    # Skip obviously bad URLs or those recently failing
+    """Fetch; write to buffer; THEN unblank. On failure keep whatever is on screen."""
+    global last_image_url, last_image_frame, blank_displayed
     if _is_definitely_bad_art_url(url) or _in_bad_cache(url):
         logger.warning(f"Art: skipping bad URL: {url}")
         return False
-
     try:
-        # Fetch BEFORE turning the screen on, to avoid flashes
         r = requests.get(url, timeout=10)
         r.raise_for_status()
-        image = Image.open(BytesIO(r.content))
-        try:
-            w, h = image.size
-            if w < 64 or h < 64:
-                raise ValueError(f"art too small {w}x{h}")
-        except Exception:
-            pass
+        image = Image.open(BytesIO(r.content)).convert("RGBA")
+        # pre-scale to screen once; also cache for instant resume
+        scaled = image.resize((WIDTH, HEIGHT))
+        last_image_frame = scaled.copy()
 
-        # Success → ensure display on, then draw
-        display_power_on()
-        _display_image(image)
+        # Write first, then unblank to avoid flash
+        _display_image(scaled)
+        if blank_displayed:
+            display_power_on()
+            time.sleep(0.01)          # tiny settle; avoids right-to-left slide look
+            _display_image(scaled)    # write again post-unblank
+            blank_displayed = False
+
+
         last_image_url = url
-        blank_displayed = False
         logger.info(f"Art: {speaker_name} -> {url}")
         return True
     except Exception as e:
         logger.error(f"Art fetch/display failed: {e}")
         _mark_bad(url)
-        # Do NOT blank here. Keep last good frame to avoid flicker.
         return False
 
+# ---------- Overlay glyphs (simple + Sonos-like rounded bars) ----------
+def _parse_hex_color(s, default=(255, 255, 255)):
+    try:
+        s = s.lstrip("#")
+        if len(s) == 6:
+            return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+        if len(s) == 3:
+            return (int(s[0]*2, 16), int(s[1]*2, 16), int(s[2]*2, 16))
+    except Exception:
+        pass
+    return default
+
+def _round_rect_mask(draw, box, radius):
+    x0, y0, x1, y1 = box
+    r = max(0, int(radius))
+    if r == 0:
+        draw.rectangle((x0, y0, x1, y1), fill=255)
+        return
+    draw.rectangle((x0 + r, y0,     x1 - r, y1), fill=255)
+    draw.rectangle((x0,     y0 + r, x1,     y1 - r), fill=255)
+    draw.pieslice((x0, y0, x0 + 2*r, y0 + 2*r), 180, 270, fill=255)
+    draw.pieslice((x1 - 2*r, y0, x1, y0 + 2*r), 270, 360, fill=255)
+    draw.pieslice((x1 - 2*r, y1 - 2*r, x1, y1), 0, 90, fill=255)
+    draw.pieslice((x0, y1 - 2*r, x0 + 2*r, y1), 90, 180, fill=255)
+
+def _draw_feedback_icon(kind: str) -> Image.Image:
+    size = int(min(WIDTH, HEIGHT) * FEEDBACK_ICON_FRACTION)
+    cx, cy = WIDTH // 2, HEIGHT // 2
+    half = size // 2
+    aa = max(1, FEEDBACK_AA_SCALE)
+    radius_frac = FEEDBACK_RADIUS_FRAC
+
+    # hi-res mask for AA
+    w_hi, h_hi = WIDTH * aa, HEIGHT * aa
+    size_hi = size * aa
+    half_hi = size_hi // 2
+    cx_hi, cy_hi = cx * aa, cy * aa
+
+    mask = Image.new("L", (w_hi, h_hi), 0)
+    d = ImageDraw.Draw(mask)
+
+    if kind == "play":
+        left = cx_hi - size_hi // 3
+        tip  = cx_hi + half_hi
+        top  = cy_hi - half_hi
+        bot  = cy_hi + half_hi
+        d.polygon([(left, top), (left, bot), (tip, cy_hi)], fill=255)
+
+    elif kind == "pause":
+        bar_w = max(8*aa, size_hi // 4)
+        gap   = max(bar_w,  size_hi // 4)
+        rad   = int(bar_w * radius_frac)
+        x1 = cx_hi - gap//2 - bar_w
+        x2 = cx_hi + gap//2
+        y0 = cy_hi - half_hi
+        y1 = cy_hi + half_hi
+        _round_rect_mask(d, (x1, y0, x1 + bar_w, y1), rad)
+        _round_rect_mask(d, (x2, y0, x2 + bar_w, y1), rad)
+
+    elif kind == "next":
+        left1  = cx_hi - half_hi
+        midx   = cx_hi
+        right1 = cx_hi + half_hi
+        top    = cy_hi - half_hi
+        bot    = cy_hi + half_hi
+        d.polygon([(left1, top), (midx, cy_hi), (left1, bot)], fill=255)
+        d.polygon([(midx, top), (right1, cy_hi), (midx, bot)], fill=255)
+        bar_gap = max(2*aa, size_hi // 12)
+        bar_w   = max(6*aa, size_hi // 12)
+        rad     = int(bar_w * radius_frac)
+        bx0 = right1 + bar_gap
+        bx1 = bx0 + bar_w
+        _round_rect_mask(d, (bx0, top, bx1, bot), rad)
+
+    else:
+        r = max(6*aa, size_hi // 12)
+        d.ellipse((cx_hi - r, cy_hi - r, cx_hi + r, cy_hi + r), fill=255)
+
+    # downscale and colorize
+    mask = mask.resize((WIDTH, HEIGHT), Image.LANCZOS)
+    fg_rgb = _parse_hex_color(FEEDBACK_COLOR)
+    alpha = max(0, min(255, FEEDBACK_FG_ALPHA))
+    fg = Image.new("RGBA", (WIDTH, HEIGHT), (*fg_rgb, alpha))
+    out = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    out = Image.composite(fg, out, mask)
+    return out
+
+def _show_feedback(kind: str, then_blank_after_ms: int = 0):
+    if not FEEDBACK_ENABLE:
+        return
+    try:
+        # Render overlay into buffer first
+        img = _draw_feedback_icon(kind)
+        _display_image(img)
+
+        # Unblank after buffer has new frame
+        if blank_displayed:
+            display_power_on()
+            globals()['blank_displayed'] = False
+
+        logger.info(f"Feedback overlay: {kind}")
+
+        # Optional quick blank after pause overlay
+        if then_blank_after_ms > 0:
+            def _delayed_blank():
+                try:
+                    time.sleep(then_blank_after_ms / 1000.0)
+                    blank_screen()
+                except Exception:
+                    pass
+            threading.Thread(target=_delayed_blank, daemon=True, name="feedback-blank").start()
+    except Exception as e:
+        logger.debug(f"Feedback overlay failed ({kind}): {e}")
+
 # ---------- Touch controls ----------
-# Single tap = play/pause; Double tap = next track (register on RELEASE).
 _last_active_speaker_uid = None
-_last_active_speaker_lock = os._wrap_close if False else None  # placeholder to avoid linter warnings
-import threading
 _last_active_speaker_lock = threading.Lock()
 
 def set_last_active_speaker_uid(uid):
@@ -332,7 +436,6 @@ def _find_active_coordinator_from_list(speakers_list):
                     return s.group.coordinator if s.group else s
                 except Exception:
                     return s
-    # fallback: any PLAYING coordinator
     for s in speakers_list:
         try:
             tinfo = s.get_current_transport_info() or {}
@@ -342,20 +445,47 @@ def _find_active_coordinator_from_list(speakers_list):
             continue
     return speakers_list[0] if speakers_list else None
 
-def _seconds_to_hhmmss(total: int) -> str:
-    h = total // 3600
-    m = (total % 3600) // 60
-    s = total % 60
-    return f"{h}:{m:02}:{s:02}"
-
 def _toggle_play_pause(soco_obj):
+    """Simplified: overlay only on pause; on resume show cached art immediately (no overlay)."""
+    global last_image_frame, blank_displayed
     try:
         state = (soco_obj.get_current_transport_info() or {}).get("current_transport_state", "")
         if state == "PLAYING":
+            # Show ❚❚ briefly, then blank
+            _show_feedback("pause", then_blank_after_ms=FEEDBACK_PAUSE_BLANK_MS)
             logger.info("Touch: single tap - pause")
             soco_obj.pause()
         else:
-            # Rewind slightly if near end so resume doesn't instantly advance
+            # Instantly show cached art (preferred), otherwise black; no glyph on resume
+            if last_image_frame is not None:
+                # Write before unblank
+                _display_image(last_image_frame)
+                if blank_displayed:
+                    display_power_on()
+                    # tiny settle to avoid scanline artifact, then write again
+                    time.sleep(0.01)
+                    _display_image(last_image_frame)
+                    blank_displayed = False
+                logger.info("Feedback: showed cached art on resume (no glyph)")
+            else:
+                # No cache yet → keep it clean: show black, then unblank
+                try:
+                    image = Image.open(blank_path)
+                    _display_image(image)
+                except Exception:
+                    pass
+                if blank_displayed:
+                    display_power_on()
+                    time.sleep(0.01)
+                    # write black again to ensure full frame is what’s scanned out
+                    try:
+                        image = Image.open(blank_path)
+                        _display_image(image)
+                    except Exception:
+                        pass
+                    blank_displayed = False
+
+            # Optional near-end rewind (unchanged)
             try:
                 ti = soco_obj.get_current_track_info() or {}
                 pos = _hhmmss_to_seconds(ti.get("position", "0:00:00"))
@@ -381,6 +511,7 @@ def _toggle_play_pause(soco_obj):
 
 def _next_track(soco_obj):
     try:
+        _show_feedback("next")
         soco_obj.next()
     except Exception as e:
         logger.warning(f"Touch: next-track failed: {e}")
@@ -479,7 +610,16 @@ def _start_touch_listener(get_speakers_callable, on_after_action=None):
     return t
 
 # ---------- Main album-art loop ----------
-speakers = list(soco.discover()) or []
+
+def _discover_speakers(timeout=5):
+    try:
+        zs = soco.discover(timeout=timeout) or set()
+        # Return a stable list order
+        return sorted(list(zs), key=lambda z: z.uid)
+    except Exception:
+        return []
+
+speakers = _discover_speakers()
 logger.info(f"Discovered {len(speakers)} speakers.")
 last_discovery = datetime.now()
 
@@ -487,65 +627,66 @@ last_discovery = datetime.now()
 def _get_speakers_snapshot():
     return speakers
 
-
-def _force_refresh_after_action():
-    global last_image_url, blank_displayed
-    blank_displayed = True    # so next draw forces redraw even if same URL
-    last_image_url = last_image_url  # unchanged
-
-
-_start_touch_listener(_get_speakers_snapshot, _force_refresh_after_action)
+# Touch listener already resolves the active coordinator from the current snapshot
+_start_touch_listener(_get_speakers_snapshot, on_after_action=None)
 
 STALE_WINDOW_SEC = 12
 last_pos = {}
 
 while running:
     try:
-        # periodic rediscovery
+        # Periodically re-discover in case IPs/groups change
         if datetime.now() - last_discovery > timedelta(minutes=5):
-            speakers = list(soco.discover()) or []
+            speakers = _discover_speakers(timeout=5)
             logger.info(f"Rediscovered {len(speakers)} speakers.")
             last_discovery = datetime.now()
 
         found_art = False
         now = datetime.now()
 
-        for speaker in speakers:
+        # Build current groups and always query the group coordinator for track/art
+        try:
+            groups = sorted({z.group for z in speakers}, key=lambda g: g.uid)
+        except Exception:
+            groups = []
+
+        for g in groups:
             try:
-                tinfo = speaker.get_current_transport_info()
-                state = (tinfo or {}).get("current_transport_state", "")
+                coord = g.coordinator
+                if coord is None:
+                    continue
+
+                tinfo = coord.get_current_transport_info() or {}
+                state = tinfo.get("current_transport_state", "")
                 if state not in ("PLAYING", "TRANSITIONING"):
                     continue
 
-                track_info = speaker.get_current_track_info() or {}
+                track_info = coord.get_current_track_info() or {}
                 art_url = track_info.get("album_art")
                 if not art_url:
-                    # no art, keep searching other speakers
                     continue
 
-                # staleness: position must advance unless source doesn't provide position
+                # Stale-position guard (per coordinator)
                 pos_s = _hhmmss_to_seconds(track_info.get("position", "0:00:00"))
-                lp = last_pos.get(speaker.uid)
+                lp = last_pos.get(coord.uid)
                 if lp is not None:
                     prev_pos, prev_t = lp["pos"], lp["t"]
                     if pos_s <= prev_pos and (now - prev_t).total_seconds() >= STALE_WINDOW_SEC:
-                        # treat as stale PLAYING
                         continue
-                last_pos[speaker.uid] = {"pos": pos_s, "t": now}
+                last_pos[coord.uid] = {"pos": pos_s, "t": now}
 
-                full_url = art_url if art_url.startswith("http") else f"http://{speaker.ip_address}:1400{art_url}"
+                # Absolute vs device-relative album art
+                if art_url.startswith("http"):
+                    full_url = art_url
+                else:
+                    full_url = f"http://{coord.ip_address}:1400{art_url}"
 
-                # Try to display. If it fails, don't blank; just keep prior frame.
-                success = display_album_art(full_url, speaker.player_name)
-                if success:
-                    set_last_active_speaker_uid(getattr(speaker, "uid", None))
+                if display_album_art(full_url, coord.player_name):
+                    set_last_active_speaker_uid(getattr(coord, "uid", None))
                     found_art = True
                     break
-                else:
-                    # URL bad for this speaker; try next speaker (if any)
-                    continue
             except Exception as e:
-                logger.warning(f"Speaker check error ({getattr(speaker, 'player_name', 'unknown')}): {e}")
+                logger.warning(f"Group check error (coord={getattr(g.coordinator, 'player_name', 'unknown')}): {e}")
 
         if not found_art:
             logger.info("No valid art this cycle → blanking screen.")
